@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+mercantile
+numpy
+Pillow
+cachetools
+python-dotenv
+gcsfs
+zarr>=3.0.0

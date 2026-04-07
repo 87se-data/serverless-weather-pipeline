@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+mercantile
+numpy
+Pillow
+cachetools
+python-dotenv
+google-cloud-datastore
+gcsfs
+zarr

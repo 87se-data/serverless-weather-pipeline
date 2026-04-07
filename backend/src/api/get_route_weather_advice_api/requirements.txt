@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+google-cloud-aiplatform
+pydantic
+astral==3.2

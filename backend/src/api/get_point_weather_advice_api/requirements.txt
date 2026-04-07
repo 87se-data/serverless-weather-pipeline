@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+google-cloud-aiplatform
+pydantic
+jpholiday
+astral

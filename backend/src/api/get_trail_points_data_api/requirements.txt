@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pytz
+numpy
+functions-framework==3.*
+google-cloud-storage
+google-cloud-datastore
+zstandard

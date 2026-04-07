@@ -1,0 +1,8 @@
+functions-framework==3.*
+pytz
+google-cloud-datastore
+google-cloud-storage
+zstandard
+numpy
+google-auth
+requests
