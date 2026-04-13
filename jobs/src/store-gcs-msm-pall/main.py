@@ -14,7 +14,7 @@ import string
 import gc
 from urllib3.exceptions import InsecureRequestWarning
 urllib3.disable_warnings(InsecureRequestWarning)
-import grib2
+import grib2_deocde
 from google.cloud import datastore
 from google.cloud import storage
 import json

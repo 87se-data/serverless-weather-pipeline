@@ -10,6 +10,7 @@ import json
 import math 
 from math import sin, cos, acos, radians
 import time
+import io
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -17,8 +18,6 @@ from google.cloud import storage
 from google.cloud import datastore
 import zstandard as zstd
 import numpy as np
-import io
-import concurrent.futures
 
 app = FastAPI()
 
@@ -38,6 +37,9 @@ GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'my-weather-bucket')
 # Routes APIのエンドポイント
 endpoint = 'https://routes.googleapis.com/directions/v2:computeRoutes'
 api_key = os.environ.get('API_KEY')
+
+storage_client = storage.Client()
+datastore_client = datastore.Client()
 
 earth_rad = 6378.137
 
@@ -66,6 +68,72 @@ def calc_thermal_indices(ta_kelvin, rh, wind_speed, solar_rad):
                 
         return apparent_temp_k, wbgt_c
 
+def get_latest_initial_time():
+    try:
+        query = datastore_client.query(kind="store-gcs-msm-surf-db")
+        query.order = ["-datetime"]
+        results = list(query.fetch(limit=1))
+        
+        if not results:
+            return None
+            
+        dt = results[0]["datetime"]
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        else:
+            dt = dt.astimezone(pytz.UTC)
+        return dt.strftime("%Y%m%d%H0000Z")
+    except Exception as e:
+        print(f"Datastore Error: {e}")
+        return None
+
+def fetch_meta_data(bucket, ini_time_str, surface):
+    if surface == 'surface':
+        surface_dir = 'surf'
+    else:
+        surface_dir = 'pall'
+        
+    blob_path = f"{surface_dir}/{ini_time_str}/dimension_map.json"
+    blob = bucket.blob(blob_path)
+    if not blob.exists():
+        print(f"Meta not found: {blob_path}")
+        return None
+    json_str = blob.download_as_string()
+    meta_data = json.loads(json_str)
+    
+    first_time_key = next(iter(meta_data))
+    target_meta = meta_data[first_time_key][surface]
+    
+    return {
+        'lat1': float(target_meta['bbox']['lat1']),
+        'lon1': float(target_meta['bbox']['lon1']),
+        'lat2': float(target_meta['bbox']['lat2']),
+        'lon2': float(target_meta['bbox']['lon2']),
+        'ny': int(target_meta['grid']['ny']),
+        'nx': int(target_meta['grid']['nx']),
+        'nlat': float(target_meta['grid']['nlat']),
+        'nlon': float(target_meta['grid']['nlon']),
+        'element_index': target_meta.get('element_index', {})
+    }
+
+def fetch_npy_data(bucket, ini_time_str, surface, target_time_str):
+    if surface == 'surface':
+        surface_dir = 'surf'
+    else:
+        surface_dir = 'pall'
+        
+    blob_path = f"{surface_dir}/{ini_time_str}/{target_time_str}/{surface}.npy.zst"
+    blob = bucket.blob(blob_path)
+    if not blob.exists():
+        print(f"NPY not found: {blob_path}")
+        return None
+    
+    dctx = zstd.ZstdDecompressor()
+    decompressed_data = dctx.decompress(blob.download_as_bytes())
+    buf = io.BytesIO(decompressed_data)
+    npy = np.load(buf)
+            
+    return npy
 
 # 複数のクエリパラメータを受け取るAPIエンドポイント
 @app.get("/data/")
@@ -75,18 +143,13 @@ def get_route_points_data_api(
         means: Optional[str] = "driving", 
         departure: Optional[int] = None,
         gpv: Optional[str] = 'MSM_GPV_Rjp_Lsurf',
-        element: Optional[str] = "1_8,0_0,1_1,2_2,2_3,4_7",
-        surface: Optional[str] = 'surface'
+        element: Optional[str] = "1_8,0_0,1_1,2_2,2_3,4_7,ssi,tt,ki,lcl,cape,cin,theta_e,water_vapor_flux,zero_degree_altitude,pressure_change_3h,6_3",
+        surface: Optional[str] = 'surface,pall,850hPa'
 ):
-        """
-        HTTPクエリから複数のパラメータを受け取り、GCSからデータを取得する
-        """
         if departure is None:
                 departure = int(time.time())
-        if not origin:
-                return {"error": "Query parameter 'origin' is required"}
-        if not destination:
-                return {"error": "Query parameter 'destination' is required"}
+        if not origin or not destination:
+                return {"error": "origin and destination are required"}
 
         request_json = {}
         request_json['origin'] = origin
@@ -97,7 +160,6 @@ def get_route_points_data_api(
         request_json['element'] = element
         request_json['surface'] = surface
 
-        # 移動手段をRoutes APIの形式に変換
         if means in ['driving', 'car', 'd']:
                 travel_mode = "DRIVE"
         elif means in ['walking', 'w']:
@@ -109,38 +171,20 @@ def get_route_points_data_api(
         else:
                 travel_mode = "DRIVE"
 
-        # 出発時刻をRoutes API用の形式(RFC3339 UTC)に変換
-        dt_utc = datetime.datetime.fromtimestamp(departure, tz=timezone('UTC'))
-        departure_time_str = dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-
         def build_waypoint(point_str: str):
-                # カンマが含まれてたら緯度経度（LatLng）として処理
                 if "," in point_str:
                         try:
                                 lat, lng = map(float, point_str.split(","))
-                                return {
-                                        "location": {
-                                                "latLng": {
-                                                        "latitude": lat,
-                                                        "longitude": lng
-                                                }
-                                        }
-                                }
+                                return {"location": {"latLng": {"latitude": lat, "longitude": lng}}}
                         except ValueError:
-                                pass # もし数字じゃなかったら下のaddressとして処理
-
-                # カンマがない、または数字じゃない場合は住所（address）として処理
+                                pass
                 return {"address": point_str}
 
-        # 最低でも現在時刻から1分後(未来)にする
         current_time = int(time.time())
         api_departure_time = departure if departure > current_time else current_time + 60
-        
-        # APIに送る用の未来時間を文字列にする
         api_dt_utc = datetime.datetime.fromtimestamp(api_departure_time, tz=timezone('UTC'))
         api_departure_time_str = api_dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        # リクエストボディのベース
         body = {
                 "origin": build_waypoint(origin),
                 "destination": build_waypoint(destination),
@@ -148,20 +192,19 @@ def get_route_points_data_api(
                 "languageCode": "ja"
         }
 
-        # 移動手段によって設定を追加
         if travel_mode == "DRIVE":
                 body["routingPreference"] = "TRAFFIC_AWARE"
                 body["departureTime"] = api_departure_time_str
         elif travel_mode == "TRANSIT":
                 body["departureTime"] = api_departure_time_str
 
+        # 💖 X-Goog-FieldMaskを修正（steps.durationを除去し、legs全体のdurationとstaticDurationを追加）
         headers = {
                 'Content-Type': 'application/json',
                 'X-Goog-Api-Key': api_key,
-                'X-Goog-FieldMask': 'routes.legs.steps.startLocation,routes.legs.steps.endLocation,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails'
+                'X-Goog-FieldMask': 'routes.legs.duration,routes.legs.staticDuration,routes.legs.steps.startLocation,routes.legs.steps.endLocation,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails,routes.legs.steps.polyline.encodedPolyline'
         }
 
-        # POSTリクエストでRoutes APIを実行
         req = urllib.request.Request(endpoint, data=json.dumps(body).encode('utf-8'), headers=headers, method='POST')
         
         try:
@@ -175,437 +218,286 @@ def get_route_points_data_api(
                 print(f"予期せぬエラー😱: {e}")
                 return {"error": "リクエスト送信中にエラーが起きたよ😭"}
 
-        # ルートが見つからなかった時のクラッシュ防止
         if not directions.get('routes'):
-                print("ルート情報が空っぽ！")
-                return {"error": "ルートが取得できなかったよ😭 (道がないか遠すぎるかも)"}
+                return {"error": "ルートが取得できなかったよ😭"}
 
-        # datetime(JST)の準備
+        # 💖 渋滞倍率（Traffic Ratio）の計算ロジック
+        leg_data = directions['routes'][0].get('legs', [{}])[0]
+        leg_duration_sec = float(leg_data.get('duration', '0s').replace('s', ''))
+        leg_static_duration_sec = float(leg_data.get('staticDuration', '0s').replace('s', ''))
+        
+        # 渋滞でどれくらい遅れているか比率を出す（例：通常10分のところが12分なら1.2倍）
+        traffic_ratio = (leg_duration_sec / leg_static_duration_sec) if leg_static_duration_sec > 0 else 1.0
+
         target_dtobj = datetime.datetime.fromtimestamp(departure, tz=timezone('Asia/Tokyo'))
         request_json['Information'] = []
         
-        # stepsのデータを取り出す
-        steps = directions['routes'][0].get('legs', [{}])[0].get('steps', [])
+        steps = leg_data.get('steps', [])
 
         for content_dict in steps:
-                input_dic = {}
+                # 💖 各ステップの staticDuration に渋滞倍率を掛けて、擬似的に渋滞考慮時間を算出
+                static_duration_str = content_dict.get('staticDuration', '0s')
+                duration_sec = float(static_duration_str.replace('s', '')) * traffic_ratio
                 
-                # 電車(TRANSIT)の時はstartLocationが消えるトラップを回避！
-                start_loc = content_dict.get('startLocation')
-                if not start_loc and 'transitDetails' in content_dict:
-                        stop_details = content_dict['transitDetails'].get('stopDetails', {})
-                        start_loc = stop_details.get('departureStop', {}).get('location')
+                encoded_poly = content_dict.get('polyline', {}).get('encodedPolyline')
                 
-                if start_loc and 'latLng' in start_loc:
-                        input_dic['latitude'] = start_loc['latLng']['latitude']
-                        input_dic['longitude'] = start_loc['latLng']['longitude']
+                if encoded_poly:
+                        poly_coords = decode_polyline(encoded_poly)
+                        seg_distances = []
+                        for i in range(len(poly_coords) - 1):
+                                d = dist_on_sphere((poly_coords[i][0], poly_coords[i][1]), (poly_coords[i+1][0], poly_coords[i+1][1]))
+                                seg_distances.append(d)
+                                
+                        total_dist = sum(seg_distances)
+                        
+                        request_json['Information'].append({
+                                'latitude': poly_coords[0][0],
+                                'longitude': poly_coords[0][1],
+                                'datetime': "%s" % target_dtobj.isoformat(timespec='seconds')
+                        })
+                        
+                        for i in range(len(poly_coords) - 1):
+                                time_ratio = (seg_distances[i] / total_dist) if total_dist > 0 else (1.0 / len(seg_distances))
+                                added_sec = duration_sec * time_ratio
+                                target_dtobj += datetime.timedelta(seconds=added_sec)
+                                
+                                request_json['Information'].append({
+                                        'latitude': poly_coords[i+1][0],
+                                        'longitude': poly_coords[i+1][1],
+                                        'datetime': "%s" % target_dtobj.isoformat(timespec='seconds')
+                                })
                 else:
-                        print("座標が見つからなかったよ😭 スキップするね！")
-                        continue
+                        start_loc = content_dict.get('startLocation')
+                        if not start_loc and 'transitDetails' in content_dict:
+                                start_loc = content_dict['transitDetails'].get('stopDetails', {}).get('departureStop', {}).get('location')
+                        
+                        if start_loc and 'latLng' in start_loc:
+                                request_json['Information'].append({
+                                        'latitude': start_loc['latLng']['latitude'],
+                                        'longitude': start_loc['latLng']['longitude'],
+                                        'datetime': "%s" % target_dtobj.isoformat(timespec='seconds')
+                                })
+                        target_dtobj += datetime.timedelta(seconds=duration_sec)
 
-                input_dic['datetime'] = "%s" % target_dtobj.isoformat(timespec='seconds')
-                request_json['Information'].append(input_dic)
-
-                # 所要時間を足して、次の地点への時間を計算（floatにして小数の秒数に対応）
-                duration_str = content_dict.get('duration', content_dict.get('staticDuration', '0s'))
-                duration_sec = float(duration_str.replace('s', ''))
-                target_dtobj += datetime.timedelta(seconds=duration_sec)
-
-        # ループが終わった後（一番最後）に、最終目的地（endLocation）を追加する！
-        if steps: # stepsが空っぽじゃない時だけ
+        if steps:
                 last_step = steps[-1]
-                final_dic = {}
-                
-                # 最終目的地もtransitDetailsを考慮！
                 end_loc = last_step.get('endLocation')
                 if not end_loc and 'transitDetails' in last_step:
-                        stop_details = last_step['transitDetails'].get('stopDetails', {})
-                        end_loc = stop_details.get('arrivalStop', {}).get('location')
+                        end_loc = last_step['transitDetails'].get('stopDetails', {}).get('arrivalStop', {}).get('location')
 
                 if end_loc and 'latLng' in end_loc:
-                        final_dic['latitude'] = end_loc['latLng']['latitude']
-                        final_dic['longitude'] = end_loc['latLng']['longitude']
-                        final_dic['datetime'] = "%s" % target_dtobj.isoformat(timespec='seconds')
-                        request_json['Information'].append(final_dic)
-                else:
-                        print("最終目的地の座標が見つからなかったよ😭")
+                        request_json['Information'].append({
+                                'latitude': end_loc['latLng']['latitude'],
+                                'longitude': end_loc['latLng']['longitude'],
+                                'datetime': "%s" % target_dtobj.isoformat(timespec='seconds')
+                        })
 
-        # GCSからのデータ取得処理へ
         return get(request_json)
 
 
 def get(route_data):
         start = time.time()
-
         draw_num = 200
-        
-        # =====================================================================
-        # 1. Datastoreから最新の初期時刻を取得する
-        # =====================================================================
-        try:
-                datastore_client = datastore.Client()
-                query = datastore_client.query(kind='store-gcs-msm-surf-db')
-                query.order = ['-datetime']
-                results = list(query.fetch(limit=1))
-                
-                if not results:
-                        return {"error": "Datastoreに有効な気象データの初期時刻がありません"}
-                initial_datetime = results[0]['datetime']
-        except Exception as e:
-                print(f"Datastore Query Error: {e}")
-                return {"error": "Datastoreクエリ中にエラーが発生しました"}
 
-        # initial_datetimeをUTCに変換して文字列化
-        if initial_datetime.tzinfo is None:
-                # タイムゾーン情報がない場合はJSTとして扱う
-                initial_datetime = timezone('Asia/Tokyo').localize(initial_datetime)
-        
-        ini_dt_obj_utc = initial_datetime.astimezone(timezone('UTC'))
-        ini_datetime_utc = ini_dt_obj_utc.strftime("%Y%m%d%H0000Z")
+        ini_time_str = get_latest_initial_time()
+        if not ini_time_str:
+            return {"error": "Datastoreに有効な気象データの初期時刻がありません"}
 
-        # =====================================================================
-        # 2. GCSクライアントとメタデータのロード
-        # =====================================================================
-        gcs_client = storage.Client()
-        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
-
-        meta_blob = bucket.blob(f"surf/{ini_datetime_utc}/dimension_map.json")
-        try:
-                meta_json_str = meta_blob.download_as_text()
-                meta_data = json.loads(meta_json_str)
-        except Exception as e:
-                print(f"メタデータ取得エラー: {e}")
-                return {"error": "メタデータの取得に失敗しました"}
-        
-        first_time_key = next(iter(meta_data))
-        surface_meta = meta_data.get(first_time_key, {}).get('surface', {})
-        # ?? element_index は surface の中にあるので、surface_meta から取得する
-        element_index = surface_meta.get('element_index', {})
-        bbox = surface_meta.get('bbox')
-        grid = surface_meta.get('grid')
-        
-        if not bbox or not grid or len(bbox) < 4 or len(grid) < 4:
-                return {"error": "メタデータの形式が不正です"}
-        
-        if isinstance(bbox, dict):
-                lat1 = float(bbox['lat1'])
-                lon1 = float(bbox['lon1'])
-                lat2 = float(bbox['lat2'])
-                lon2 = float(bbox['lon2'])
-        else:
-                lat1, lon1, lat2, lon2 = map(float, bbox)
-                
-        if isinstance(grid, dict):
-                nlat = float(grid['nlat'])
-                nlon = float(grid['nlon'])
-                ny = int(grid['ny'])
-                nx = int(grid['nx'])
-        else:
-                nlat = float(grid[0])
-                nlon = float(grid[1])
-                ny = int(grid[2])
-                nx = int(grid[3])
-
-        # ルートを時刻順に整理する
         route_info_list = sorted(route_data['Information'], key=lambda x:x['datetime'])
         if not route_info_list:
-                return {"error": "Route information is empty"}
+            return {"error": "Route information is empty"}
 
-        # 時間と移動経路から、各時刻の緯度経度を求める
-        total_distance = 0.0
-        distance_list = []      # 区間ごとの距離リスト
-        speed_list = [] # 区間ごとの速度リスト(秒速)
-        for index in range(len(route_info_list)):
-                distance = 0.0
-                if index == 0:
-                        distance_list.append(0.0)
-                        speed_list.append(0.0)
-                        continue
-                pos1_list = [route_info_list[index-1]['latitude'],route_info_list[index-1]['longitude']]
-                pos2_list = [route_info_list[index]['latitude'],route_info_list[index]['longitude']]
-                if pos1_list[0] != pos2_list[0] or pos1_list[1] != pos2_list[1]:
-                        distance = dist_on_sphere( [float(pos1_list[0]),float(pos1_list[1])],[float(pos2_list[0]),float(pos2_list[1])] )
-                distance_list.append(distance)
-                time1_dtobj = datetime.datetime.fromisoformat(route_info_list[index-1]['datetime'])
-                time2_dtobj = datetime.datetime.fromisoformat(route_info_list[index]['datetime'])
-                delta = time2_dtobj - time1_dtobj
-                delta_seconds = delta.total_seconds()
-                if delta_seconds > 0:
-                        speed_list.append( distance / delta_seconds )
-                else:
-                        speed_list.append( 0.0 )
-                total_distance += distance
-                
         departure_dtobj = datetime.datetime.fromisoformat(route_info_list[0]['datetime'])
-        arrival_dtobj = datetime.datetime.fromisoformat(route_info_list[len(route_info_list)-1]['datetime'])
+        arrival_dtobj = datetime.datetime.fromisoformat(route_info_list[-1]['datetime'])
         total_eptime = arrival_dtobj.timestamp() - departure_dtobj.timestamp()
         
-        check_point_dict = {}
-        check_point_dict_rain = {}
         target_unit_eptime = total_eptime / draw_num
         target_dtobj = departure_dtobj
-        advanced_distance = 0.0
         
-        for _ in range(draw_num + 1):
-                target_unit_distance = 0.0
-                target_dtobj_utc = target_dtobj.astimezone(timezone('UTC'))
-                target_time = target_dtobj_utc.strftime("%Y%m%d%H0000Z")
-                target_dtobj_utc_rain = target_dtobj_utc + datetime.timedelta(hours=1)
-                target_time_rain = target_dtobj_utc_rain.strftime("%Y%m%d%H0000Z")
-                if check_point_dict.get(target_time) == None:
-                        check_point_dict[target_time] = []
-                if check_point_dict_rain.get(target_time_rain) == None:
-                        check_point_dict_rain[target_time_rain] = []
-                        
-                if advanced_distance == 0.0:
-                        check_point_dict[target_time].append([target_dtobj.strftime("%Y-%m-%dT%H:%M:%S+09:00"),route_info_list[0]['latitude'],route_info_list[0]['longitude']])
-                        check_point_dict_rain[target_time_rain].append([target_dtobj.strftime("%Y-%m-%dT%H:%M:%S+09:00"),route_info_list[0]['latitude'],route_info_list[0]['longitude']])
-                        target_unit_distance = speed_list[1] * target_unit_eptime
-                else:
-                        tmp_distance = 0.0
-                        for dis_index in range( len(distance_list) ):
-                                tmp_distance += distance_list[dis_index]
-                                point_dtobj = datetime.datetime.fromisoformat(route_info_list[dis_index]['datetime'])
-                                if tmp_distance >= advanced_distance:
-                                        break
-                                if target_dtobj <= point_dtobj:
-                                        break
-                        overflow_distance = advanced_distance - (tmp_distance - distance_list[dis_index])
-                        pos1_lat = route_info_list[dis_index-1]['latitude']
-                        pos1_lon = route_info_list[dis_index-1]['longitude']
-                        pos2_lat = route_info_list[dis_index]['latitude']
-                        pos2_lon = route_info_list[dis_index]['longitude']
-                        diff_lat = pos2_lat - pos1_lat
-                        diff_lon = pos2_lon - pos1_lon
-                        overflow_distance_rate = 0.0
-                        if distance_list[dis_index] != 0:
-                                overflow_distance_rate = overflow_distance / distance_list[dis_index]
-                        write_lat = pos1_lat + (diff_lat * overflow_distance_rate)
-                        write_lon = pos1_lon + (diff_lon * overflow_distance_rate)
+        points = []
 
-                        check_point_dict[target_time].append([target_dtobj.strftime("%Y-%m-%dT%H:%M:%S+09:00"),write_lat,write_lon])
-                        check_point_dict_rain[target_time_rain].append([target_dtobj.strftime("%Y-%m-%dT%H:%M:%S+09:00"),write_lat,write_lon])
-                        target_unit_distance = speed_list[dis_index] * target_unit_eptime
-                advanced_distance += target_unit_distance
+        for _ in range(draw_num + 1):
+                current_dis_index = 1
+                for dis_index in range(1, len(route_info_list)):
+                        point_dtobj = datetime.datetime.fromisoformat(route_info_list[dis_index]['datetime'])
+                        current_dis_index = dis_index
+                        if target_dtobj <= point_dtobj:
+                                break
+                
+                pos1_lat = float(route_info_list[current_dis_index-1]['latitude'])
+                pos1_lon = float(route_info_list[current_dis_index-1]['longitude'])
+                pos2_lat = float(route_info_list[current_dis_index]['latitude'])
+                pos2_lon = float(route_info_list[current_dis_index]['longitude'])
+                
+                point1_dtobj = datetime.datetime.fromisoformat(route_info_list[current_dis_index-1]['datetime'])
+                point2_dtobj = datetime.datetime.fromisoformat(route_info_list[current_dis_index]['datetime'])
+                
+                seg_total_sec = (point2_dtobj - point1_dtobj).total_seconds()
+                elapsed_sec = (target_dtobj - point1_dtobj).total_seconds()
+                
+                time_ratio = 0.0
+                if seg_total_sec > 0:
+                        time_ratio = max(0.0, min(1.0, elapsed_sec / seg_total_sec))
+                
+                write_lat = pos1_lat + (pos2_lat - pos1_lat) * time_ratio
+                write_lon = pos1_lon + (pos2_lon - pos1_lon) * time_ratio
+
+                points.append({
+                    "dt": target_dtobj,
+                    "lat": write_lat,
+                    "lon": write_lon
+                })
+                
                 target_dtobj = target_dtobj + datetime.timedelta(seconds=target_unit_eptime)
+
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        meta_cache = {}
+        npy_cache = {}
+
+        def get_meta(surf):
+            key = surf
+            if key not in meta_cache:
+                meta_cache[key] = fetch_meta_data(bucket, ini_time_str, surf)
+            return meta_cache[key]
+
+        def get_npy(surf, t_str):
+            key = (surf, t_str)
+            if key not in npy_cache:
+                npy_cache[key] = fetch_npy_data(bucket, ini_time_str, surf, t_str)
+            return npy_cache[key]
 
         request_json = {}
         request_json['information'] = {}
 
-        max_date_utc = max(check_point_dict.keys())
-        min_date_utc = min(check_point_dict.keys())
-        max_dtobj_utc = datetime.datetime.strptime(max_date_utc, "%Y%m%d%H%M%SZ").replace(tzinfo=pytz.utc)
-        min_dtobj_utc = datetime.datetime.strptime(min_date_utc, "%Y%m%d%H%M%SZ").replace(tzinfo=pytz.utc)
-        max_dtobj_utc = max_dtobj_utc + datetime.timedelta(hours=1)
-        max_time = max_dtobj_utc.strftime("%Y%m%d%H0000Z")
-        check_point_dict[max_time] = []
-        min_time = min_dtobj_utc.strftime("%Y%m%d%H0000Z")
-        check_point_dict_rain[min_time] = []
+        elements = route_data['element'].split(',')
+        surfaces = route_data['surface'].split(',')
 
-        # =====================================================================
-        # 3. .npy の並列ダウンロードとキャッシュ
-        # =====================================================================
-        # 対象時間のリストを取得
-        target_times = sorted(list(set(list(check_point_dict.keys()) + list(check_point_dict_rain.keys()))))
-        all_required_times = set()
-        
-        for current_time_str in target_times:
-                dt_obj_utc = datetime.datetime.strptime(current_time_str, "%Y%m%d%H%M%SZ").replace(tzinfo=pytz.utc)
-                dt_obj_utc_hour_ago = dt_obj_utc - datetime.timedelta(hours=1)
-                prev_time_str = dt_obj_utc_hour_ago.strftime("%Y%m%d%H0000Z")
-                all_required_times.add(current_time_str)
-                all_required_times.add(prev_time_str)
+        for pt in points:
+            dt_jst = pt['dt']
+            dt_utc = dt_jst.astimezone(timezone('UTC'))
+            lat = pt['lat']
+            lon = pt['lon']
 
-        npy_cache = {}
+            time_str_jst = dt_jst.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+            
+            if time_str_jst not in request_json['information']:
+                request_json['information'][time_str_jst] = {
+                    'latitude': format(lat, '.4f'),
+                    'longitude': format(lon, '.4f')
+                }
 
-        def fetch_single_npy(target_time_str):
-                npy_blob = bucket.blob(f"surf/{ini_datetime_utc}/{target_time_str}/surface.npy.zst")
-                try:
-                        buf = npy_blob.download_as_bytes()
-                        dctx = zstd.ZstdDecompressor()
-                        decompressed_data = dctx.decompress(buf)
-                        data = np.load(io.BytesIO(decompressed_data))
-                        return data
-                except Exception as e:
-                        print(f"NPYのダウンロードまたは展開に失敗しました ({target_time_str}): {e}")
-                        return None
+            for surf in surfaces:
+                if surf == 'surface':
+                    t1_utc = dt_utc.replace(minute=0, second=0, microsecond=0)
+                    t2_utc = t1_utc + datetime.timedelta(hours=1)
+                    t1_str = t1_utc.strftime("%Y%m%d%H0000Z")
+                    t2_str = t2_utc.strftime("%Y%m%d%H0000Z")
+                    rate = (dt_utc - t1_utc).total_seconds() / 3600.0
+                else:
+                    base_hour = (dt_utc.hour // 3) * 3
+                    t1_utc = dt_utc.replace(hour=base_hour, minute=0, second=0, microsecond=0)
+                    t2_utc = t1_utc + datetime.timedelta(hours=3)
+                    t1_str = t1_utc.strftime("%Y%m%d%H0000Z")
+                    t2_str = t2_utc.strftime("%Y%m%d%H0000Z")
+                    rate = (dt_utc - t1_utc).total_seconds() / 10800.0
 
-        # 並列で一気に取得
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-                future_to_time = {executor.submit(fetch_single_npy, t_str): t_str for t_str in all_required_times}
-                for future in concurrent.futures.as_completed(future_to_time):
-                        t_str = future_to_time[future]
-                        try:
-                                npy_cache[t_str] = future.result()
-                        except Exception as exc:
-                                print(f"{t_str} generated an exception: {exc}")
-                                npy_cache[t_str] = None
+                if surf not in request_json['information'][time_str_jst]:
+                    request_json['information'][time_str_jst][surf] = {}
+                
+                meta = get_meta(surf)
+                element_index = meta.get('element_index', {}) if meta else {}
+                row, col = -1, -1
+                in_bounds = False
+                
+                if meta:
+                    lat1 = meta['lat1']
+                    lon1 = meta['lon1']
+                    lat2 = meta['lat2']
+                    lon2 = meta['lon2']
+                    nlat = meta['nlat']
+                    nlon = meta['nlon']
+                    ny = meta['ny']
+                    nx = meta['nx']
+                    
+                    if (min(lat1, lat2) <= lat <= max(lat1, lat2)) and (min(lon1, lon2) <= lon <= max(lon1, lon2)):
+                        r = int(abs(lat1 - lat) / abs(nlat))
+                        c = int(abs(lon - lon1) / abs(nlon))
+                        row = max(0, min(r, ny - 1))
+                        col = max(0, min(c, nx - 1))
+                        in_bounds = True
+                
+                if not in_bounds:
+                    continue
+                
+                npy_start = get_npy(surf, t1_str)
+                npy_next = get_npy(surf, t2_str)
+                
+                for elem in elements:
+                    z_idx = element_index.get(f"{surf}:{elem}")
+                    if z_idx is None:
+                        z_idx = element_index.get(elem)
 
-        # リクエストされている要素
-        requested_elements = route_data['element'].split(',')
-
-        # =====================================================================
-        # 4. 座標からインデックスへの変換と値の抽出
-        # =====================================================================
-        for current_time_str in target_times:
-                dt_obj_utc = datetime.datetime.strptime(current_time_str, "%Y%m%d%H%M%SZ").replace(tzinfo=pytz.utc)
-                dt_obj_utc_hour_ago = dt_obj_utc - datetime.timedelta(hours=1)
-                prev_time_str = dt_obj_utc_hour_ago.strftime("%Y%m%d%H0000Z")
-
-                # この時間の npy データを取得
-                curr_data = npy_cache.get(current_time_str)
-                prev_data = npy_cache.get(prev_time_str)
-
-                # 対象のチェックポイントリスト
-                check_points_curr = check_point_dict.get(current_time_str, [])
-                check_points_prev = check_point_dict.get(prev_time_str, [])
-                check_points_prev_rain = check_point_dict_rain.get(prev_time_str, [])
-
-                # 値を格納するヘルパー関数
-                def update_json(dt_jst, lat, lon, element, val, is_interpolation=False):
-                        if dt_jst not in request_json['information']:
-                                request_json['information'][dt_jst] = {
-                                        'latitude': format(lat, '.4f'),
-                                        'longitude': format(lon, '.4f'),
-                                        'surface': {}
-                                }
-                        if 'surface' not in request_json['information'][dt_jst]:
-                                request_json['information'][dt_jst]['surface'] = {}
+                    if elem == '1_8':
+                        val_next = None
+                        if npy_next is not None and z_idx is not None:
+                            try:
+                                v = float(npy_next[z_idx][row][col])
+                                if not np.isnan(v):
+                                    val_next = v
+                            except Exception:
+                                pass
+                        if val_next is not None:
+                            request_json['information'][time_str_jst][surf][elem] = format(val_next, '.1f')
+                    else:
+                        val_start = None
+                        val_next = None
+                        if npy_start is not None and z_idx is not None:
+                            try:
+                                v = float(npy_start[z_idx][row][col])
+                                if not np.isnan(v):
+                                    val_start = v
+                            except Exception:
+                                pass
+                        if npy_next is not None and z_idx is not None:
+                            try:
+                                v = float(npy_next[z_idx][row][col])
+                                if not np.isnan(v):
+                                    val_next = v
+                            except Exception:
+                                pass
                         
-                        if is_interpolation:
-                                # 時間案分のための初期値をセット
-                                if f"{element}_start" not in request_json['information'][dt_jst]['surface']:
-                                        request_json['information'][dt_jst]['surface'][f"{element}_start"] = val
-                        else:
-                                request_json['information'][dt_jst]['surface'][element] = val
+                        if val_start is not None and val_next is not None:
+                            calc_gpv = val_start + (val_next - val_start) * rate
+                            request_json['information'][time_str_jst][surf][elem] = format(calc_gpv, '.1f')
+                        elif val_next is not None:
+                            request_json['information'][time_str_jst][surf][elem] = format(val_next, '.1f')
+                        elif val_start is not None:
+                            request_json['information'][time_str_jst][surf][elem] = format(val_start, '.1f')
 
-
-                # 前時間の値を取得 (補間用スタート値)
-                if prev_data is not None:
-                        for point_info in check_points_prev:
-                                dt_jst = point_info[0]
-                                lat = point_info[1]
-                                lon = point_info[2]
-                                
-                                # 範囲外チェック
-                                if lat > lat1 or lat < lat2 or lon < lon1 or lon > lon2:
-                                        continue
-
-                                row = int(round((lat1 - lat) / nlat))
-                                col = int(round((lon - lon1) / nlon))
-                                
-                                # 範囲外インデックスチェック
-                                if row < 0 or row >= ny or col < 0 or col >= nx:
-                                        continue
-
-                                for element in requested_elements:
-                                        if element != '1_8' and element in element_index:
-                                                z_idx = element_index.get(element)
-                                                val = float(prev_data[z_idx, row, col])
-                                                if not np.isnan(val):
-                                                        update_json(dt_jst, lat, lon, element, val, is_interpolation=True)
-
-                        for point_info in check_points_prev_rain:
-                                dt_jst = point_info[0]
-                                lat = point_info[1]
-                                lon = point_info[2]
-
-                                if lat > lat1 or lat < lat2 or lon < lon1 or lon > lon2:
-                                        continue
-
-                                row = int(round((lat1 - lat) / nlat))
-                                col = int(round((lon - lon1) / nlon))
-                                
-                                if row < 0 or row >= ny or col < 0 or col >= nx:
-                                        continue
-
-                                if '1_8' in requested_elements and '1_8' in element_index:
-                                        z_idx = element_index.get('1_8')
-                                        val = float(prev_data[z_idx, row, col])
-                                        if not np.isnan(val):
-                                                update_json(dt_jst, lat, lon, '1_8', val, is_interpolation=False)
-
-                # 現時間の値を取得 (補間用エンド値、またはそのまま)
-                if curr_data is not None:
-                        for point_info in check_points_curr:
-                                dt_jst = point_info[0]
-                                lat = point_info[1]
-                                lon = point_info[2]
-
-                                if lat > lat1 or lat < lat2 or lon < lon1 or lon > lon2:
-                                        continue
-
-                                row = int(round((lat1 - lat) / nlat))
-                                col = int(round((lon - lon1) / nlon))
-                                
-                                if row < 0 or row >= ny or col < 0 or col >= nx:
-                                        continue
-
-                                for element in requested_elements:
-                                        if element != '1_8' and element in element_index:
-                                                z_idx = element_index.get(element)
-                                                val_next = float(curr_data[z_idx, row, col])
-                                                if np.isnan(val_next):
-                                                        continue
-                                                
-                                                if dt_jst in request_json['information'] and f"{element}_start" in request_json['information'][dt_jst]['surface']:
-                                                        # 線形補間（時間案分）
-                                                        val_start = request_json['information'][dt_jst]['surface'][f"{element}_start"]
-                                                        target_dtobj = datetime.datetime.fromisoformat(dt_jst)
-                                                        hour_ago_dt_utc = dt_obj_utc - datetime.timedelta(hours=1)
-                                                        delta = target_dtobj.astimezone(timezone('UTC')) - hour_ago_dt_utc
-                                                        rate = delta.total_seconds() / 3600.0
-                                                        calc_gpv = val_start + (val_next - val_start) * rate
-                                                        update_json(dt_jst, lat, lon, element, format(calc_gpv, '.1f'))
-                                                        # 使い終わったスタート値を削除
-                                                        del request_json['information'][dt_jst]['surface'][f"{element}_start"]
-                                                else:
-                                                        update_json(dt_jst, lat, lon, element, format(val_next, '.1f'))
-
-                                        elif element == '1_8' and element in element_index:
-                                                pass # 1_8はrain用チェックポイントで取得済み
-
-        # クリーンアップ: 余分な _start キーを削除
         for dt_jst, info_dict in request_json['information'].items():
-                if 'surface' in info_dict:
-                        keys_to_delete = [k for k in info_dict['surface'].keys() if k.endswith('_start')]
-                        for k in keys_to_delete:
-                                del info_dict['surface'][k]
+                for key, val_dict in info_dict.items():
+                        if isinstance(val_dict, dict):
+                                ta_str = val_dict.get('0_0')
+                                rh_str = val_dict.get('1_1')
+                                u_str = val_dict.get('2_2')
+                                v_str = val_dict.get('2_3')
+                                sr_str = val_dict.get('4_7')
 
-        # =====================================================================
-        # 5. 体感温度（apparent_temp）とWBGTを計算するロジック
-        # =====================================================================
-        for dt_jst, info_dict in request_json['information'].items():
-                if 'surface' in info_dict:
-                        val_dict = info_dict['surface']
-                        ta_str = val_dict.get('0_0') # 気温
-                        rh_str = val_dict.get('1_1') # 湿度
-                        u_str = val_dict.get('2_2')  # 風(U)
-                        v_str = val_dict.get('2_3')  # 風(V)
-                        sr_str = val_dict.get('4_7') # 🌞 日射量
+                                if ta_str and rh_str and u_str and v_str:
+                                        ta_kelvin = float(ta_str)
+                                        rh = float(rh_str)
+                                        u = float(u_str)
+                                        v = float(v_str)
+                                        solar_rad = float(sr_str) if sr_str else 0.0
+                                        wind_speed = math.sqrt(u**2 + v**2)
+                                        app_temp, wbgt = calc_thermal_indices(ta_kelvin, rh, wind_speed, solar_rad)
+                                        if app_temp is not None:
+                                                val_dict['apparent_temp'] = format(app_temp, '.1f')
+                                        if wbgt is not None:
+                                                val_dict['wbgt'] = format(wbgt, '.1f')
 
-                        if ta_str and rh_str and u_str and v_str:
-                                ta_kelvin = float(ta_str)
-                                rh = float(rh_str)
-                                u = float(u_str)
-                                v = float(v_str)
-                                solar_rad = float(sr_str) if sr_str else 0.0
-
-                                wind_speed = math.sqrt(u**2 + v**2)
-
-                                # 体感温度とWBGTをまとめて算出！
-                                app_temp, wbgt = calc_thermal_indices(ta_kelvin, rh, wind_speed, solar_rad)
-                                
-                                if app_temp is not None:
-                                        val_dict['apparent_temp'] = format(app_temp, '.1f')
-                                if wbgt is not None:
-                                        val_dict['wbgt'] = format(wbgt, '.1f')
-
-        elapsed_time = time.time() - start
-        # print(f"🚀 GCS Pipeline 処理時間: {elapsed_time:.3f}秒")
         return request_json
 
-# 二点間の緯度経度の距離算出に使用する関数
 def latlng_to_xyz(lat, lng):
         rlat, rlng = radians(lat), radians(lng)
         coslat = cos(rlat)
@@ -614,3 +506,31 @@ def latlng_to_xyz(lat, lng):
 def dist_on_sphere(pos0, pos1, radious=earth_rad):
         xyz0, xyz1 = latlng_to_xyz(*pos0), latlng_to_xyz(*pos1)
         return acos(sum(x * y for x, y in zip(xyz0, xyz1)))*radious
+
+def decode_polyline(polyline_str):
+    index, lat, lng = 0, 0, 0
+    coordinates = []
+    length = len(polyline_str)
+    while index < length:
+        shift, result = 0, 0
+        while True:
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += dlat
+        shift, result = 0, 0
+        while True:
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += dlng
+        coordinates.append((lat / 1e5, lng / 1e5))
+    return coordinates
