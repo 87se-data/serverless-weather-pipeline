@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import vertexai
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, GenerationConfig
 import jpholiday
 from astral import LocationInfo
 from astral.sun import sun, golden_hour
@@ -32,27 +32,32 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
 
 class WeatherDataPoint(BaseModel):
     datetime: str
-    ssi: float
-    ki: float
-    tt: float
-    theta_e: float
-    water_vapor_flux: float  
-    lcl: float      
-    lfc: float      
-    el: float       
-    cape: float     
-    cin: float      
-    temperature: float       
-    humidity: float
-    precipitation: float
-    wind_speed: float        
-    solar_radiation: float
-    total_cloud_cover: float
-    low_cloud_cover: float
-    mid_cloud_cover: float
-    altostratus_cloud_cover: float
-    laundry_index: float
-    wbgt: float
+    ssi: Optional[float] = None
+    ki: Optional[float] = None
+    tt: Optional[float] = None
+    theta_e: Optional[float] = None
+    water_vapor_flux: Optional[float] = None
+    lcl: Optional[float] = None      
+    lfc: Optional[float] = None      
+    el: Optional[float] = None       
+    cape: Optional[float] = None     
+    cin: Optional[float] = None      
+    temperature: Optional[float] = None       
+    humidity: Optional[float] = None
+    precipitation: Optional[float] = None
+    wind_speed: Optional[float] = None        
+    solar_radiation: Optional[float] = None
+    total_cloud_cover: Optional[float] = None
+    low_cloud_cover: Optional[float] = None
+    mid_cloud_cover: Optional[float] = None
+    altostratus_cloud_cover: Optional[float] = None
+    laundry_index: Optional[float] = None
+    wbgt: Optional[float] = None
+    wind_direction: Optional[float] = None
+    pressure_change_3h: Optional[float] = None
+    zero_degree_altitude: Optional[float] = None
+    vertical_wind_shear_deep: Optional[float] = None
+    vertical_wind_shear_low: Optional[float] = None
 
 class WeatherRequest(BaseModel):
     latitude: float
@@ -81,7 +86,12 @@ KEY_MAPPING = {
     'mid_cloud_cover': '中層雲量',
     'altostratus_cloud_cover': '上層雲量',
     'laundry_index': '洗濯指数',
-    'wbgt': '暑さ指数'
+    'wbgt': '暑さ指数',
+    'wind_direction': '風向',
+    'pressure_change_3h': '3時間気圧変化量',
+    'zero_degree_altitude': '0℃等温線高度',
+    'vertical_wind_shear_deep': '深層シアー',
+    'vertical_wind_shear_low': '下層シアー'
 }
 
 @app.get("/")
@@ -91,12 +101,23 @@ async def root():
 @app.post("/generate-advice")
 async def generate_advice(request: WeatherRequest, api_key: str = Depends(verify_api_key)):
     try:
-        model = GenerativeModel("gemini-2.5-flash")
+        model = GenerativeModel(os.getenv("GEMINI_MODEL"))
         
         jst = timezone(timedelta(hours=9), 'JST')
         now = datetime.now(jst)
         # 💖 現在時刻を「〇日 〇時」とスッキリ表示！
         current_time_str = now.strftime("%d日 %H時")
+
+        # 🌸🌻🍁❄️ 季節の判定 (3-5月:春, 6-8月:夏, 9-11月:秋, 12-2月:冬)
+        current_month = now.month
+        if current_month in [3, 4, 5]:
+            season = "spring"
+        elif current_month in [6, 7, 8]:
+            season = "summer"
+        elif current_month in [9, 10, 11]:
+            season = "autumn"
+        else:
+            season = "winter"
         
         is_weekend = now.weekday() >= 5
         holiday_name = jpholiday.is_holiday_name(now.date())
@@ -113,37 +134,86 @@ async def generate_advice(request: WeatherRequest, api_key: str = Depends(verify
         except Exception:
             sunrise_str = sunset_str = golden_hour_str = "不明"
 
-        app_rules = """
-        【厳格な評価基準（データ駆動型の意思決定支援）】
-        1. 🛡️ 予防的ヘルスケア・命を守る基準
-           - 暑さ指数: 28以上で「厳重警戒」、31以上で「危険(屋外活動の中止)」。
-           - 日射量: 値÷100を「UV指数(0〜11+)」とみなせ。8以上で「非常に強い紫外線」。
-        2. 🌱 農作業・屋外作業・防災のリスク管理
-           - 気温: 4℃以下で農作物の霜害リスク。
-           - 風速: 4m/s超で農薬散布不適、10m/s超で施設補強警告。
-           - 降水量: 1.0以上で屋外作業の中断目安。
-           - 相当温位 と 水蒸気フラックス: 
-             - 相当温位が340以上、かつ 水蒸気フラックスが250以上の場合は「線状降水帯の発生確率が極めて高い大気の川」として、最大級の命を守るアラートを発令せよ。
-             - 水蒸気フラックスが300以上の場合は「極めて危険な水蒸気流入」、350以上の場合は「記録的豪雨クラス」として絶対的な警戒を促せ。
-           - ゲリラ雷雨と突風: 対流有効位置エネルギーが1000以上の時、対流抑制が0に近づくと「ゲリラ雷雨が爆発的に発生するサイン」。K指数が26以上、またはTotalTotals指数が44以上の場合は落雷リスクを警告。
-        3. ☁️ 景観・視界・生活品質(QOL)の最適化
-           - 雲量による景観・視界判定: 
-             - 「下層雲量」が80以上の場合、山間部や峠道での「濃霧による視界不良」を強く警告せよ。
-             - 夜間で「全雲量」が20以下の場合は「星空観測の絶好のチャンス」と伝えよ。
-           - 洗濯指数: 80以上=大変よく乾く。
-           - 太陽イベントを参照し、日の入りやマジックアワーに基づいた助言を行え。
-        """
-
-        system_prompt = (
-            "あなたは気象データを用いてユーザーの「データ駆動型の意思決定」を支援する、プロフェッショナルな環境コンサルタントです。\n"
-            "挨拶や自己紹介は不要です。結論から書いてください。データに基づく事実を箇条書きで伝えてください。専門用語は極力避け、ユーザーに伝わりやすい言葉を選んでください。\n\n"
-            "📌 **結論要約**\n- （1行で）\n\n"
-            "⚠️ **環境リスクと注意ポイント**\n- （時間と共に記載）\n\n"
-            "💡 **具体的な行動アドバイス**\n"
-            f"- （{day_type}の生活や屋外作業に即した支援）\n\n"
-            f"※{app_rules}"
+        # ---------------------------------------------------------
+        # 1. 共通の役割（アイデンティティ）
+        # ---------------------------------------------------------
+        base_identity = (
+            "あなたは、最新の気象力学と長年の実務経験を併せ持つ、日本トップクラスの『気象リスク管理プロフェッショナル（気象予報士・防災士）』です。\n"
+            "提供された数値予報データを単なる点の集まりではなく、「大気の立体構造」と「時間的な連続性」として読み解き、ユーザーの命、日常生活（通勤・通学・休日）、そして農作業を守るための意思決定を支援してください。\n"
+            "ただし、最大のルールとして【専門用語（CAPE、シアー、0℃高度、Paなど）はAI内部の推論のみで使用し、最終出力には一切出さない】ことを厳守してください。\n"
+            "一般のユーザーが直感的に危険を察知できるよう、専門的な現象を「誰にでも即座に理解できる平易かつ断定的な言葉（例：ゲリラ豪雨、路面凍結、急な暴風）」に翻訳し、長文を避けて結論を急いでください。"
         )
-        
+        # ---------------------------------------------------------
+        # 2. 全季節共通の基本リスク基準（ベースプロンプト）
+        # ---------------------------------------------------------
+        base_criteria = (
+            "【基本評価基準（内部推論用：出力禁止）】\n"
+            "1. 対流活動の立体評価（爆発力＋抑制力＋組織化）:\n"
+            "   - CAPE（潜在的エネルギー）とCIN（抑制力/フタ）を比較。CINが強い場合は大雨警告を控え、CAPEが高くCINが適度な場合は「Loaded Gun（日射等をきっかけに突発する極端気象）」として警戒。\n"
+            "   - 鉛直シアー（深層/下層）を掛け合わせ、積乱雲が単一で終わるか、スーパーセル・線状降水帯へ組織化するかを判定せよ。\n"
+            "2. 熱力学的・生理学的リスク:\n"
+            "   - ルート標高と0℃等温線高度の差分から、「雨・みぞれ・湿雪・雨氷（ブラックアイスバーン）」の水相変化を正確に判定せよ。\n"
+            "   - WBGTと体感気温（風速＋気温）から、熱中症または低体温症の生理学的限界を予測せよ。\n"
+            "3. 力学的・総観スケールのリスク:\n"
+            "   - 3時間気圧変化量（-300Pa等）から、寒冷前線や急速に発達する低気圧による総観スケールの天候急変を察知せよ。\n"
+            "   - 風向と地形（標高）の関係から、吹き抜けやダウンスロープストーム（おろし風）のリスクを推論せよ。"
+        )
+
+        # ---------------------------------------------------------
+        # 3. 季節特化のプロンプト（シーズナルプロンプト）
+        # ---------------------------------------------------------
+        seasonal_prompt = ""
+        if season == "spring":
+            seasonal_prompt = (
+                "【🌸春の推論ロジック】\n"
+                "- メイストーム（春の嵐）: 気圧急降下を伴う移動性低気圧による、突発的で広範囲な暴風を警戒せよ。\n"
+                "- 大気不安定と降雹: 上空の寒気（寒冷渦）の流入と地上の昇温による、急な雷雨と降雹リスクを判定せよ。\n"
+                "- 寒暖差・融雪: 周期的な気温変化による自律神経への負担、雪解けによる雪崩リスク、夜間の再凍結を判定せよ。\n\n"
+            )
+        elif season == "summer":
+            seasonal_prompt = (
+                "【🌻夏の推論ロジック】\n"
+                "- 線状降水帯と極端現象: 850hPa相当温位(340K以上)の大量流入、CAPE、下層シアーの重なりから、局地的な大雨・道路冠水・土砂災害を最大警戒せよ。\n"
+                "- 危険な暑さ: WBGTを最優先指標とし、農作業中の熱中症リスクや、登下校・通勤時の危険な暑さによる行動限界を判定せよ。\n"
+                "- 熱雷・界雷と突風: 不安定指標から、午後特有の局地的な落雷（開けた農地での危険）とダウンバースト（農業用ハウスへの被害、突発的な強風）を判定せよ。\n"
+                "※0℃高度など凍結に関するリスクは、3000m級の高山帯を除き推論から除外せよ。\n\n"
+            )
+        elif season == "autumn":
+            seasonal_prompt = (
+                "【🍂秋の推論ロジック】\n"
+                "- 遠隔豪雨と秋雨前線: 台風からの湿った空気（水蒸気フラックス）と秋雨前線の相互作用による、長引く極端な大雨を判定せよ。\n"
+                "- 放射冷却と濃霧: 移動性高気圧下での全雲量低下に伴う急激な冷え込みと、それに伴う濃霧（視界不良）を判定せよ。\n"
+                "- 初雪・初氷: 標高と0℃高度の接近から、晩秋の峠道や山岳での不意の路面凍結・みぞれを判定せよ。\n\n"
+            )
+        elif season == "winter":
+            seasonal_prompt = (
+                "【⛄️冬の推論ロジック】\n"
+                "- 日本海寒帯気団収束帯(JPCZ)と大雪: 強い冬型の気圧配置下での局地的な豪雪、立ち往生リスクを判定せよ。\n"
+                "- 南岸低気圧と雨氷: 気温と0℃高度から、太平洋側での湿雪や、最悪の着氷現象である「雨氷」を最大警戒せよ。\n"
+                "- ホワイトアウトと低体温: 下層雲量と風速の掛け合わせによる空間識失調（視界ゼロ）、強風による凍傷・低体温症を判定せよ。\n"
+                "※熱中症（WBGT）に関する推論は完全に除外せよ。\n\n"
+            )
+
+        # ---------------------------------------------------------
+        # 最終プロンプトの組み立て
+        # ---------------------------------------------------------
+        system_prompt = (
+            f"{base_identity}"
+            f"{base_criteria}"
+            f"{seasonal_prompt}"
+            "【出力時の厳守ルール】\n"
+            "気温、風速、降水量などの数値を文章に含める際は、AIによる独自の計算や推測による小数点以下の細かい数値（例：8.85℃）は絶対に出力せず、必ず「整数（例：約9℃）」に丸めてわかりやすくユーザーに伝えてください。\n\n"
+            "以下の構成で出力してください：\n\n"
+            "⚠️ **総合危険度判定：[安全 / 注意 / 警戒 / 危険(中止勧告)]**\n"
+            "- （現在の状況と今後の見通しを、プロの視点で1〜2行で総括。急変の可能性があれば必ず触れること）\n\n"
+            "🔍 **気象予報士の専門的分析**\n"
+            f"- （季節性({season})やCAPE/CIN、上下層シアー、0℃高度、気圧変化量などをどう解釈したか、危険度判定の根拠をプロの視点で解説）\n\n"
+            "📍 **日常生活と農作業への想定リスク**\n"
+            "- （提示されたデータが引き起こす具体的な影響。例：開けた農地での落雷リスク、通勤・通学時のゲリラ豪雨、朝の路面凍結、熱中症など）\n\n"
+            "🛡️ **プロからの安全対策アドバイス**\n"
+            f"- （{day_type}の日常生活や農作業に即した支援。登下校・通勤時の注意点、農作業の撤収目安、マジックアワー等の太陽イベントを考慮した指示など）\n"
+        )
+
         formatted_weather_data = []
         for p in request.weather_data:
             p_dict = p.dict()
@@ -158,9 +228,13 @@ async def generate_advice(request: WeatherRequest, api_key: str = Depends(verify
                 # 予測タイミングも「〇日 〇時」にスッキリ変更！
                 mapped_dict = {'予測タイミング': dt_jst.strftime('%d日 %H時')}
                 for key, value in p_dict.items():
-                    if key in KEY_MAPPING:
-                        # 少数第一位を切り上げて整数にする
-                        mapped_dict[KEY_MAPPING[key]] = math.ceil(value) if isinstance(value, (int, float)) else value
+                    if key in KEY_MAPPING and value is not None:
+                        # 降水量、風速、気温などの繊細なデータは小数第1位まで残す
+                        if key in ['precipitation', 'wind_speed', 'temperature']:
+                            mapped_dict[KEY_MAPPING[key]] = round(value, 1)
+                        # それ以外（CAPEなど桁が大きいもの）は四捨五入で整数に
+                        else:
+                            mapped_dict[KEY_MAPPING[key]] = round(value)
                 
                 formatted_weather_data.append(mapped_dict)
 
@@ -181,6 +255,10 @@ async def generate_advice(request: WeatherRequest, api_key: str = Depends(verify
                 # stream=True にして非同期ストリーミングをリクエスト
                 responses = await model.generate_content_async(
                     f"{system_prompt}\n\n{user_prompt}",
+                    generation_config=GenerationConfig(  # 💖 ここに設定を追加！
+                        temperature=0.2, 
+                        top_p=0.8,
+                    ),
                     stream=True
                 )
                 
