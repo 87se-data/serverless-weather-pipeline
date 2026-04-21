@@ -49,7 +49,9 @@
 
 ## 📺 Demo
 > [!TIP]
-> ※ ここに後日、Android 実機の動作動画（GIF/MP4）を貼り付ける予定です。
+https://github.com/user-attachments/assets/1fed3801-6392-4830-8964-5fc976f338d4
+
+https://github.com/user-attachments/assets/62ff9815-3c6a-4dfd-8600-28af75c1b628
 
 ---
 
